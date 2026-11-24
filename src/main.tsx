@@ -6,7 +6,7 @@ import './styles.css'
 type Card = { id: string; emoji: string; label: string; image?: string }
 type Session = { id: string; name: string; open: boolean; leaderboard: boolean; nicknamesRequired: boolean; status: 'waiting'|'live'|'ended'; code: string; draftCards: Card[]; publishedCards: Card[] }
 type Result = { id: string; sessionId: string; pseudo: string; time: number; moves: number; pairs: number; date: string }
-type Player = { id:string; pseudo:string; joinedAt:string }
+type Player = { id:string; pseudo:string; joinedAt:string; lastSeen:string }
 
 const starterCards: Card[] = [
   { id:'1', emoji:'🍓', label:'Fraise' }, { id:'2', emoji:'🍋', label:'Citron' },
@@ -132,14 +132,42 @@ function GameView({ session, results, players, setPlayers, onFinish }: {session:
   useEffect(() => { if (finished) setViewFinished(true) }, [finished])
 
   useEffect(() => {
+    sessionStorage.setItem('memory-player-id', playerId)
+  }, [playerId])
+
+  useEffect(() => {
     if (!session.open) return
-    setPlayers(current => {
+    const joinOrUpdate = () => {
       const name = pseudo.trim() || 'Joueur'
-      const existing = current.find(player => player.id === playerId)
-      if (existing?.pseudo === name) return current
-      return [...current.filter(player => player.id !== playerId), { id:playerId, pseudo:name, joinedAt:existing?.joinedAt || new Date().toISOString() }]
-    })
+      setPlayers(current => {
+        const existing = current.find(player => player.id === playerId)
+        return [
+          ...current.filter(player => player.id !== playerId),
+          { id:playerId, pseudo:name, joinedAt:existing?.joinedAt || new Date().toISOString(), lastSeen:new Date().toISOString() }
+        ]
+      })
+    }
+    joinOrUpdate()
+    const heartbeat = window.setInterval(joinOrUpdate, 4000)
+    const leave = () => setPlayers(current => current.filter(player => player.id !== playerId))
+    window.addEventListener('beforeunload', leave)
+    return () => {
+      window.clearInterval(heartbeat)
+      window.removeEventListener('beforeunload', leave)
+    }
   }, [playerId, pseudo, session.open, setPlayers])
+
+  useEffect(() => {
+    const purge = () => {
+      setPlayers(current => {
+        const cutoff = Date.now() - 15000
+        const active = current.filter(player => player.lastSeen && new Date(player.lastSeen).getTime() > cutoff)
+        return active.length === current.length ? current : active
+      })
+    }
+    const timer = window.setInterval(purge, 5000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   if (!session.open) return <section className="closed-state"><div className="closed-icon"><Pause size={34}/></div><p className="eyebrow">SESSION INDISPONIBLE</p><h1>La partie est fermée</h1><p>Revenez plus tard ou demandez à l'administrateur d'ouvrir l'animation.</p></section>
 
