@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BarChart3, Clock3, Gamepad2, LayoutDashboard, Link2, Medal, Pause, RotateCcw, Settings2, Share2, Trophy } from 'lucide-react'
+import * as Y from 'yjs'
+import { WebsocketProvider } from 'y-websocket'
 import './styles.css'
 
 type Card = { id: string; emoji: string; label: string; image?: string }
@@ -23,15 +25,19 @@ function loadSession(): Session {
   const saved = localStorage.getItem(STORAGE_SESSION)
   if (saved) {
     const session = JSON.parse(saved)
-    return { ...session, status: session.status || 'waiting', code: session.code || 'ABC123' }
+    return { ...session, status: session.status || 'waiting', code: /^\d{4}$/.test(session.code) ? session.code : String(Math.floor(1000 + Math.random() * 9000)) }
   }
-  return { id:'anim-2026', name:'Memory Fruits', open:true, leaderboard:true, nicknamesRequired:false, status:'waiting', code:'ABC123', draftCards:[...starterCards], publishedCards:[...starterCards] }
+  return { id:'anim-2026', name:'Memory Fruits', open:true, leaderboard:true, nicknamesRequired:false, status:'waiting', code:String(Math.floor(1000 + Math.random() * 9000)), draftCards:[...starterCards], publishedCards:[...starterCards] }
 }
 
 function shuffle<T>(items:T[]) { return [...items].sort(() => Math.random() - 0.5) }
 
 function App() {
-  const [session, setSession] = useState<Session>(loadSession)
+  const [session, setSession] = useState<Session>(() => {
+    const loaded = loadSession()
+    const joinCode = new URLSearchParams(location.search).get('join')
+    return joinCode && /^\d{4}$/.test(joinCode) ? {...loaded, code:joinCode, status:'waiting'} : loaded
+  })
   const [results, setResults] = useState<Result[]>(() => JSON.parse(localStorage.getItem(STORAGE_RESULTS) || '[]'))
   const [view, setView] = useState<'game'|'leaderboard'|'admin'>(() => {
     if (new URLSearchParams(location.search).has('join') || location.hash === '#game') return 'game'
@@ -39,6 +45,47 @@ function App() {
     return 'admin'
   })
   const [players, setPlayers] = useState<Player[]>(() => JSON.parse(localStorage.getItem(STORAGE_PLAYERS) || '[]'))
+
+  const sharedRoom = useRef<{doc:Y.Doc;provider:WebsocketProvider;ySession:Y.Map<unknown>;yPlayers:Y.Map<unknown>}|null>(null)
+
+  useEffect(() => {
+    const doc = new Y.Doc()
+    const provider = new WebsocketProvider('wss://demos.yjs.dev', `memory-room-${session.code}`, doc)
+    const ySession = doc.getMap('session')
+    const yPlayers = doc.getMap('players')
+    sharedRoom.current = {doc, provider, ySession, yPlayers}
+
+    const syncSession = () => {
+      const shared = ySession.get('session') as Partial<Session>|undefined
+      if (shared?.code) setSession(current => ({...current, ...shared}))
+    }
+    const syncPlayers = () => setPlayers(Object.values(yPlayers.toJSON()) as Player[])
+    ySession.observe(syncSession)
+    yPlayers.observe(syncPlayers)
+
+    return () => {
+      ySession.unobserve(syncSession)
+      yPlayers.unobserve(syncPlayers)
+      provider.destroy()
+      doc.destroy()
+      sharedRoom.current = null
+    }
+  }, [session.code])
+
+  useEffect(() => {
+    if (!sharedRoom.current) return
+    sharedRoom.current.ySession.set('session', session)
+  }, [session])
+
+  useEffect(() => {
+    if (!sharedRoom.current) return
+    const yPlayers = sharedRoom.current.yPlayers
+    const ids = new Set(players.map(player => player.id))
+    yPlayers.forEach((_value, key) => {
+      if (!ids.has(key)) yPlayers.delete(key)
+    })
+    players.forEach(player => yPlayers.set(player.id, player))
+  }, [players])
 
   useEffect(() => localStorage.setItem(STORAGE_SESSION, JSON.stringify(session)), [session])
   useEffect(() => localStorage.setItem(STORAGE_RESULTS, JSON.stringify(results)), [results])
@@ -86,6 +133,10 @@ function GameView({ session, results, players, setPlayers, onFinish }: {session:
   const [finished, setFinished] = useState(false)
   const [pseudo, setPseudo] = useState('')
   const [playerId] = useState(() => sessionStorage.getItem('memory-player-id') || crypto.randomUUID())
+  const joinFromUrl = new URLSearchParams(location.search).get('join') || ''
+  const [joinCode,setJoinCode] = useState(joinFromUrl)
+  const [joined,setJoined] = useState(false)
+  const [joinError,setJoinError] = useState('')
   const lock = useRef(false)
 
   const reset = () => {
@@ -136,7 +187,7 @@ function GameView({ session, results, players, setPlayers, onFinish }: {session:
   }, [playerId])
 
   useEffect(() => {
-    if (!session.open) return
+    if (!session.open || !joined) return
     const joinOrUpdate = () => {
       const name = pseudo.trim() || 'Joueur'
       setPlayers(current => {
@@ -155,7 +206,7 @@ function GameView({ session, results, players, setPlayers, onFinish }: {session:
       window.clearInterval(heartbeat)
       window.removeEventListener('beforeunload', leave)
     }
-  }, [playerId, pseudo, session.open, setPlayers])
+  }, [playerId, pseudo, joined, session.open, setPlayers])
 
   useEffect(() => {
     const purge = () => {
@@ -171,7 +222,9 @@ function GameView({ session, results, players, setPlayers, onFinish }: {session:
 
   if (!session.open) return <section className="closed-state"><div className="closed-icon"><Pause size={34}/></div><p className="eyebrow">SESSION INDISPONIBLE</p><h1>La partie est fermée</h1><p>Revenez plus tard ou demandez à l'administrateur d'ouvrir l'animation.</p></section>
 
-  if (session.status === 'waiting') return <section className="waiting-room"><div className="waiting-card"><div className="waiting-icon"><Clock3 size={34}/></div><p className="eyebrow">CODE {session.code}</p><h1>{session.name}</h1><p className="waiting-copy">Vous êtes dans la salle d'attente. La partie commencera au lancement par l'administrateur.</p><label className="field"><span>Votre pseudo</span><input value={pseudo} onChange={e=>setPseudo(e.target.value)} placeholder={session.nicknamesRequired?'Pseudo obligatoire':'Pseudo facultatif'}/></label><div className="waiting-status"><span/><strong>{players.length}</strong> joueur{players.length>1?'s':''} connecté{players.length>1?'s':''}</div></div></section>
+  if (!joined) return <section className="waiting-room"><div className="waiting-card"><div className="waiting-icon"><Link2 size={34}/></div><p className="eyebrow">REJOINDRE UNE SALLE</p><h1>{session.name}</h1><label className="field"><span>Code à 4 chiffres</span><input className="join-code" value={joinCode} maxLength={4} inputMode="numeric" onChange={e=>setJoinCode(e.target.value.replace(/\D/g,''))} placeholder="1234"/></label><label className="field"><span>Votre pseudo</span><input value={pseudo} onChange={e=>setPseudo(e.target.value)} placeholder="Ex. Alex"/></label>{joinError&&<p className="join-error">{joinError}</p>}<button className="btn primary join-button" onClick={()=>{if(joinCode!==session.code){setJoinError('Code de salle incorrect.');return}if(!pseudo.trim()){setJoinError('Veuillez saisir votre pseudo.');return}setJoinError('');setJoined(true)}}>Rejoindre la salle</button></div></section>
+
+  if (session.status === 'waiting') return <section className="waiting-room"><div className="waiting-card"><div className="waiting-icon"><Clock3 size={34}/></div><p className="eyebrow">CODE {session.code}</p><h1>{session.name}</h1><p className="waiting-copy">Vous êtes dans la salle d'attente. La partie commencera au lancement par l'administrateur.</p><div className="waiting-status"><span/><strong>{players.length}</strong> joueur{players.length>1?'s':''} connecté{players.length>1?'s':''}</div></div></section>
 
   return <section className="game-layout">
     <div className="game-head">
@@ -217,7 +270,7 @@ function AdminView({session,results,players,setSession,setResults,setPlayers}:{s
     <div className="admin-content">
       {tab==='overview' && <><div className="page-heading"><div><p className="eyebrow">TABLEAU DE BORD</p><h1>Vue d'ensemble</h1></div></div><div className="metric-grid"><Metric icon={<Gamepad2/>} label="Parties jouées" value={sessionResults.length}/><Metric icon={<Clock3/>} label="Temps moyen" value={sessionResults.length?`${Math.round(sessionResults.reduce((a,r)=>a+r.time,0)/sessionResults.length/60)} min`:'—'}/><Metric icon={<RotateCcw/>} label="Coups moyens" value={sessionResults.length?Math.round(sessionResults.reduce((a,r)=>a+r.moves,0)/sessionResults.length):'—'}/></div><div className="admin-card"><div className="card-heading"><div><p className="eyebrow">DERNIÈRES PARTIES</p><h2>Activité récente</h2></div></div>{sessionResults.length===0?<div className="small-empty">Aucune partie enregistrée</div>:sessionResults.slice(-5).reverse().map(r=><div className="activity-row" key={r.id}><span className="avatar">{r.pseudo.charAt(0).toUpperCase()}</span><strong>{r.pseudo}</strong><span>{r.moves} coups</span><strong>{Math.floor(r.time/60)}:{String(r.time%60).padStart(2,'0')}</strong></div>)}</div></>}
       {tab==='content' && <><div className="page-heading"><div><p className="eyebrow">ÉDITION</p><h1>Contenu du jeu</h1></div><span className="draft-badge">Brouillon</span></div><div className="admin-card"><label className="field"><span>Nom de l'animation</span><input value={name} onChange={e=>setName(e.target.value)}/></label><div className="card-heading"><div><p className="eyebrow">PAIRES</p><h2>Cartes du Memory</h2></div></div><div className="card-editor">{session.draftCards.map((card,i)=><div className="editable-card" key={card.id}>{card.image?<img className="edit-preview" src={card.image} alt={card.label}/>:<span className="edit-emoji">{card.emoji}</span>}<div className="edit-card-fields"><input value={card.label} onChange={e=>setSession(s=>({...s,draftCards:s.draftCards.map((c,j)=>j===i?{...c,label:e.target.value}:c)}))}/><label className="image-upload">Choisir une image<input type="file" accept="image/*" onChange={e=>{const file=e.target.files?.[0];if(file)resizeCardImage(file,image=>setSession(s=>({...s,draftCards:s.draftCards.map((c,j)=>j===i?{...c,image}:c)})))}}/></label>{card.image&&<button className="remove-image" onClick={()=>setSession(s=>({...s,draftCards:s.draftCards.map((c,j)=>j===i?{...c,image:undefined}:c)}))}>Supprimer l'image</button>}</div></div>)}</div><div className="publish-bar"><button className="btn primary" onClick={publish}>Publier les modifications</button></div></div></>}
-      {tab==='share' && <><div className="page-heading"><div><p className="eyebrow">CONFIGURATION</p><h1>Session & partage</h1></div></div><div className="settings-grid"><div className="admin-card lobby-card"><div className="lobby-heading"><div><p className="eyebrow">SALLE D'ATTENTE</p><h2>{players.length} joueur{players.length>1?'s':''} connecté{players.length>1?'s':''}</h2></div><span className={`lobby-status ${session.status}`}>{session.status==='waiting'?'En attente':session.status==='live'?'Partie lancée':'Terminée'}</span></div><div className="player-list">{players.length===0?<p className="small-empty">Aucun joueur pour le moment</p>:players.map(player=><div className="lobby-player" key={player.id}><span className="avatar">{player.pseudo.charAt(0).toUpperCase()}</span><strong>{player.pseudo}</strong><span>Prêt</span></div>)}</div><div className="lobby-actions">{session.status==='waiting'?<button className="btn primary" onClick={()=>setSession(s=>({...s,status:'live',open:true}))}><Gamepad2 size={16}/> Lancer pour tous</button>:<button className="btn secondary" onClick={()=>{setPlayers([]);setSession(s=>({...s,status:'waiting'}))}}>Nouvelle salle d'attente</button>}<button className="btn secondary" onClick={()=>setSession(s=>({...s,status:'waiting',open:true}))}>Réinitialiser la salle</button></div></div><div className="admin-card"><h2>État de la session</h2><Toggle label="Session ouverte" checked={session.open} onChange={()=>setSession(s=>({...s,open:!s.open}))}/><Toggle label="Activer le classement" checked={session.leaderboard} onChange={()=>setSession(s=>({...s,leaderboard:!s.leaderboard}))}/><Toggle label="Pseudo obligatoire" checked={session.nicknamesRequired} onChange={()=>setSession(s=>({...s,nicknamesRequired:!s.nicknamesRequired}))}/><button className="btn danger" onClick={()=>{if(confirm('Réinitialiser toutes les statistiques ?'))setResults([])}}><RotateCcw size={16}/> Réinitialiser les statistiques</button></div><div className="admin-card share-card"><h2>Lien des participants</h2><div className="qr"><img src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=12&data=${encodeURIComponent(shareUrl)}`} alt="QR code de la session"/></div><div className="share-link admin-link"><Link2 size={16}/><input readOnly value={adminUrl}/><button onClick={()=>navigator.clipboard.writeText(adminUrl)}>Copier admin</button></div><div className="share-link"><Link2 size={16}/><input readOnly value={shareUrl}/><button onClick={()=>navigator.clipboard.writeText(shareUrl)}>Copier</button></div></div></div></>}
+      {tab==='share' && <><div className="page-heading"><div><p className="eyebrow">CONFIGURATION</p><h1>Session & partage</h1></div></div><div className="settings-grid"><div className="admin-card lobby-card"><div className="lobby-heading"><div><p className="eyebrow">SALLE D'ATTENTE</p><h2>{players.length} joueur{players.length>1?'s':''} connecté{players.length>1?'s':''}</h2></div><span className={`lobby-status ${session.status}`}>{session.status==='waiting'?'En attente':session.status==='live'?'Partie lancée':'Terminée'}</span></div><div className="player-list">{players.length===0?<p className="small-empty">Aucun joueur pour le moment</p>:players.map(player=><div className="lobby-player" key={player.id}><span className="avatar">{player.pseudo.charAt(0).toUpperCase()}</span><strong>{player.pseudo}</strong><span>Prêt</span></div>)}</div><div className="lobby-actions">{session.status==='waiting'?<button className="btn primary" onClick={()=>setSession(s=>({...s,status:'live',open:true}))}><Gamepad2 size={16}/> Lancer pour tous</button>:<button className="btn secondary" onClick={()=>{setPlayers([]);setSession(s=>({...s,status:'waiting'}))}}>Nouvelle salle d'attente</button>}<button className="btn secondary" onClick={()=>{const code=String(Math.floor(1000+Math.random()*9000));setPlayers([]);setSession(s=>({...s,status:'waiting',open:true,code}))}}>Créer une nouvelle salle</button></div></div><div className="admin-card"><h2>État de la session</h2><Toggle label="Session ouverte" checked={session.open} onChange={()=>setSession(s=>({...s,open:!s.open}))}/><Toggle label="Activer le classement" checked={session.leaderboard} onChange={()=>setSession(s=>({...s,leaderboard:!s.leaderboard}))}/><Toggle label="Pseudo obligatoire" checked={session.nicknamesRequired} onChange={()=>setSession(s=>({...s,nicknamesRequired:!s.nicknamesRequired}))}/><button className="btn danger" onClick={()=>{if(confirm('Réinitialiser toutes les statistiques ?'))setResults([])}}><RotateCcw size={16}/> Réinitialiser les statistiques</button></div><div className="admin-card share-card"><h2>Code de la salle : {session.code}</h2><h2>Lien des participants</h2><div className="qr"><img src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=12&data=${encodeURIComponent(shareUrl)}`} alt="QR code de la session"/></div><div className="share-link admin-link"><Link2 size={16}/><input readOnly value={adminUrl}/><button onClick={()=>navigator.clipboard.writeText(adminUrl)}>Copier admin</button></div><div className="share-link"><Link2 size={16}/><input readOnly value={shareUrl}/><button onClick={()=>navigator.clipboard.writeText(shareUrl)}>Copier</button></div></div></div></>}
     </div>
   </section>
 }
